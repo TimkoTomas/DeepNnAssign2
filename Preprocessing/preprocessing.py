@@ -7,7 +7,7 @@ import torch
 from torch.utils.data import DataLoader, TensorDataset
 
 
-data = pd.read_csv('./movie1000.csv')
+data = pd.read_csv('Preprocessing/movie1000.csv')
 data=data.head(1000)
 relevantData = data[['reviewText','scoreSentiment']]
 relevantData = relevantData.dropna(subset=['reviewText', 'scoreSentiment'])

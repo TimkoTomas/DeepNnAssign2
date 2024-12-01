@@ -1,35 +1,69 @@
-import pandas as pd
-from datasets import Dataset, DatasetDict
+import torch
 from transformers import BertTokenizer, BertForSequenceClassification, Trainer, TrainingArguments
-from sklearn.model_selection import train_test_split
-import numpy as np
+from sklearn.metrics import precision_recall_fscore_support, accuracy_score
+import json
+import os
 
-# Load the CSV file
-df = pd.read_csv('movie1000.csv')
+# Load pre-saved datasets
+train_data = torch.load('train_data.pt')
+val_data = torch.load('val_data.pt')
+test_data = torch.load('test_data.pt')
 
-# Preprocess the 'reviewText' column (e.g., remove NaNs, lowercasing, etc.)
-df['reviewText'] = df['reviewText'].fillna('').astype(str).str.lower()
+# Extract inputs, attention masks, and labels from the TensorDataset
+train_inputs, train_masks, train_labels = train_data.tensors
+val_inputs, val_masks, val_labels = val_data.tensors
+test_inputs, test_masks, test_labels = test_data.tensors
 
-# Encode sentiment labels (assuming 'POSITIVE' -> 1 and 'NEGATIVE' -> 0)
-df['label'] = df['scoreSentiment'].apply(lambda x: 1 if x == 'POSITIVE' else 0)
+# Remove the extra dimension (squeeze the tensors)
+train_inputs = train_inputs.squeeze(1)  # Shape: [582, 52]
+train_masks = train_masks.squeeze(1)    # Shape: [582, 52]
+val_inputs = val_inputs.squeeze(1)      # Shape: [X, 52]
+val_masks = val_masks.squeeze(1)        # Shape: [X, 52]
+test_inputs = test_inputs.squeeze(1)    # Shape: [X, 52]
+test_masks = test_masks.squeeze(1)      # Shape: [X, 52]
 
-# Split the dataset into training and evaluation sets
-train_df, eval_df = train_test_split(df, test_size=0.2, random_state=42)
+# Print input shapes for debugging
+print("Train inputs shape:", train_inputs.shape)
+print("Train masks shape:", train_masks.shape)
+print("Train labels shape:", train_labels.shape)
 
-# Convert to Hugging Face Dataset
-train_dataset = Dataset.from_pandas(train_df[['reviewText', 'label']])
-eval_dataset = Dataset.from_pandas(eval_df[['reviewText', 'label']])
+# Custom Dataset for Hugging Face Trainer
+class SentimentDataset(torch.utils.data.Dataset):
+    def __init__(self, input_ids, attention_mask, labels):
+        self.input_ids = input_ids
+        self.attention_mask = attention_mask
+        self.labels = labels
 
-# Tokenize the dataset
-tokenizer = BertTokenizer.from_pretrained('bert-base-uncased')
-def tokenize_function(examples):
-    return tokenizer(examples['reviewText'], truncation=True, padding=True, max_length=512)
+    def __getitem__(self, idx):
+        return {
+            'input_ids': self.input_ids[idx],
+            'attention_mask': self.attention_mask[idx],
+            'labels': self.labels[idx]
+        }
 
-tokenized_train_dataset = train_dataset.map(tokenize_function, batched=True)
-tokenized_eval_dataset = eval_dataset.map(tokenize_function, batched=True)
+    def __len__(self):
+        return len(self.input_ids)
+
+# Create datasets
+train_dataset = SentimentDataset(train_inputs, train_masks, train_labels)
+val_dataset = SentimentDataset(val_inputs, val_masks, val_labels)
+test_dataset = SentimentDataset(test_inputs, test_masks, test_labels)
 
 # Load pre-trained BERT model for sequence classification
-model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=2)
+model = BertForSequenceClassification.from_pretrained('bert-base-uncased', num_labels=3)  # num_labels=3 for POSITIVE, NEGATIVE, NEUTRAL
+
+# Function to compute metrics: precision, recall, f1, and accuracy
+def compute_metrics(p):
+    predictions, labels = p
+    predictions = predictions.argmax(axis=-1)  # Convert logits to predicted labels
+    precision, recall, f1, _ = precision_recall_fscore_support(labels, predictions, average='weighted', zero_division=0)
+    accuracy = accuracy_score(labels, predictions)
+    return {
+        'accuracy': accuracy,
+        'precision': precision,
+        'recall': recall,
+        'f1': f1
+    }
 
 # Define training arguments
 training_args = TrainingArguments(
@@ -42,12 +76,13 @@ training_args = TrainingArguments(
     weight_decay=0.01,
 )
 
-# Define Trainer
+# Define Trainer with the compute_metrics function
 trainer = Trainer(
     model=model,
     args=training_args,
-    train_dataset=tokenized_train_dataset,
-    eval_dataset=tokenized_eval_dataset,
+    train_dataset=train_dataset,
+    eval_dataset=val_dataset,
+    compute_metrics=compute_metrics,  # Add the compute_metrics function here
 )
 
 # Fine-tune the model
@@ -55,4 +90,29 @@ trainer.train()
 
 # Save the model and tokenizer
 model.save_pretrained('./fine-tuned-bert')
-tokenizer.save_pretrained('./fine-tuned-bert')
+
+# Collect metrics during training (after training is completed)
+metrics = trainer.state.log_history
+
+# Filter out the metrics for each epoch
+training_metrics = []
+for entry in metrics:
+    if 'eval_accuracy' in entry:  # These are evaluation metrics (you can adjust to include other metrics)
+        training_metrics.append({
+            'epoch': entry['epoch'],
+            'eval_loss': entry.get('eval_loss', None),
+            'eval_accuracy': entry['eval_accuracy'],
+            'eval_precision': entry.get('eval_precision', None),
+            'eval_recall': entry.get('eval_recall', None),
+            'eval_f1': entry.get('eval_f1', None)
+        })
+
+# Save metrics to a JSON file in the 'results' folder
+results_dir = './results'
+os.makedirs(results_dir, exist_ok=True)
+
+metrics_file = os.path.join(results_dir, 'training_metrics.json')
+with open(metrics_file, 'w') as f:
+    json.dump(training_metrics, f, indent=4)
+
+print(f"Training metrics saved to {metrics_file}")
